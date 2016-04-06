@@ -1,3 +1,8 @@
+<a name="0.3.0"></a>
+# 0.3.0 (2016-04-06)
+- build v0.3.0
+- added consistent expirable localStorage support that works just like how cookie works.
+
 <a name="0.2.5"></a>
 
 # 0.2.5 (2015-02-23)

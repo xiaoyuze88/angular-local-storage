@@ -1,6 +1,6 @@
 /**
  * An Angular module that gives you access to the browsers local storage
- * @version v0.2.7 - 2016-03-16
+ * @version v0.2.7 - 2016-04-06
  * @link https://github.com/grevory/angular-local-storage
  * @author grevory <greg@gregpike.ca>
  * @license MIT License, http://www.opensource.org/licenses/MIT
@@ -12,8 +12,21 @@ var isDefined = angular.isDefined,
   isObject = angular.isObject,
   isArray = angular.isArray,
   extend = angular.extend,
-  toJson = angular.toJson;
+  toJson = angular.toJson,
+  ONE_DAY_MILLISECONDS = 24 * 60 * 60 * 1000,
+  isPrimitive = function(sth) {
+    var type = Object.prototype.toString.call(sth).toLowerCase();
+    return '[object string],[object undefined],[object null],[object number],[object boolean]'.split(',').some(function (typeStr) {
+      return typeStr == type;
+    });
+  };
 
+/**
+ * 改动：
+ * 1. 统一过期时间设置，换为时间戳： 涉及cookie.expiry的写和读相应逻辑要做兼容，增加setExpiry方法
+ * 2. 对localStorage的读写操作增加过期时间的判断，四种数据结构做兼容： 非primitive类型，无__ts; primitive类型; 有自定义过期时间设置；
+ * 3. 增加统一的入口设置配置
+ */
 angular
   .module('LocalStorageModule', [])
   .provider('localStorageService', function() {
@@ -25,14 +38,20 @@ angular
     // });
     this.prefix = 'ls';
 
+    this.expiryPrefix = '__expiry';
+
     // You could change web storage type localstorage or sessionStorage
     this.storageType = 'localStorage';
+
+    this.expiry = {
+      value: 2 * 60 * 60 * 1000,
+      alwaysExpire: false
+    };
 
     // Cookie options (usually in case of fallback)
     // expiry = Number of days before cookies expire // 0 = Does not expire
     // path = The web path the cookie represents
     this.cookie = {
-      expiry: 30,
       path: '/'
     };
 
@@ -40,6 +59,16 @@ angular
     this.notify = {
       setItem: true,
       removeItem: false
+    };
+
+    this.setOptions = function(options) {
+
+    };
+
+    // Setter for expiry
+    this.setExpiry = function(exp, prefix) {
+      this.expiry.value = exp; // millisecond
+      prefix && (this.expiry.prefix = prefix);
     };
 
     // Setter for the prefix
@@ -56,7 +85,11 @@ angular
 
     // Setter for cookie config
     this.setStorageCookie = function(exp, path) {
-      this.cookie.expiry = exp;
+      if (exp) {
+        console.warn('Set expiry for cookie is deprecated, use setExpiry instead.');
+        // this.cookie.expiry = exp;
+        this.expiry.value = exp * ONE_DAY_MILLISECONDS; // Transform days to millisecond
+      }
       this.cookie.path = path;
       return this;
     };
@@ -81,6 +114,7 @@ angular
       var self = this;
       var prefix = self.prefix;
       var cookie = self.cookie;
+      var expiry = self.expiry;
       var notify = self.notify;
       var storageType = self.storageType;
       var webStorage;
@@ -124,14 +158,40 @@ angular
         }
       }());
 
-      // Directly adds a value to local storage
-      // If local storage is not available in the browser use cookies
-      // Example use: localStorageService.add('library','angular');
-      var addToLocalStorage = function (key, value) {
+      /**
+       * Directly adds a value to local storage
+       * If local storage is not available in the browser use cookies
+       * Example use: localStorageService.add('library','angular');
+       *
+       * @param {String}          key              The key of your value. (Required)
+       * @param {Any}             value            The value you want to storage. (Required)
+       * @param {Number/Boolean}  expiry           When it's a `Number` that greater than 0 means this value should be expired, and this number is the expiry time in millisecond.
+       *                                           When it's a `Boolean`, means this value should be expired, and use the global expiry time.
+       *                                           Otherwise, this value won't be expired.
+       * @param {Number}          expireTimeStamp  The exactly expire timeStamp. (Optional)
+       * @returns {boolean}
+       */
+      var addToLocalStorage = function (key, value, expiry, expireTimeStamp) {
+
+        var daysToExpire = 0;
+
         // Let's convert undefined values to null to get the value consistent
         if (isUndefined(value)) {
           value = null;
         } else {
+          // If need to be expired, wrapper the data and add the expire timestamp
+          if (self.expiry.alwaysExpire || expiry) {
+            value = {
+              value: value
+            };
+
+            expiry = expireTimeStamp || ((isNumber(expiry) && expiry > 0) ? expiry : self.expiry.value);
+
+            daysToExpire = expiry / ONE_DAY_MILLISECONDS;
+
+            value[self.expiryPrefix] = Date.now() + expiry;
+          }
+
           value = toJson(value);
         }
 
@@ -144,7 +204,7 @@ angular
           if (notify.setItem) {
             $rootScope.$broadcast('LocalStorageModule.notification.setitem', {key: key, newvalue: value, storageType: 'cookie'});
           }
-          return addToCookies(key, value);
+          return addToCookies(key, value, daysToExpire);
         }
 
         try {
@@ -156,14 +216,15 @@ angular
           }
         } catch (e) {
           $rootScope.$broadcast('LocalStorageModule.notification.error', e.message);
-          return addToCookies(key, value);
+
+          return addToCookies(key, value, daysToExpire);
         }
         return true;
       };
 
       // Directly get a value from local storage
       // Example use: localStorageService.get('library'); // returns 'angular'
-      var getFromLocalStorage = function (key) {
+      var getFromLocalStorage = function (key, forceNeedExpire) {
 
         if (!browserSupportsLocalStorage || self.storageType === 'cookie') {
           if (!browserSupportsLocalStorage) {
@@ -181,7 +242,42 @@ angular
         }
 
         try {
-          return JSON.parse(item);
+          item = JSON.parse(item);
+
+          // 有很多种case，：
+          // 1. 原始类型
+          //       看forceNeedExpire，如无直接返回，有的话加上再返回
+          // 2. 非原始类型
+          //       1）老的数据结构，带__ts，兼容后判断是否过期
+          //       2）无__ts与expiryPrefix，看forceNeedExpire，有则包上，然后返回，如false直接返回
+          //       3）有expiryPrefix，判断过期时间后返回
+          if (isPrimitive(item)) {
+
+            if (forceNeedExpire) {
+              addToLocalStorage(key, item, forceNeedExpire);
+              return item;
+            } else {
+              return item;
+            }
+          } else {
+
+            // 老数据结构兼容
+            if ('__ts' in item) {
+              addToLocalStorage(key, item.value, true, item.__ts);
+            }
+
+            if (self.expiryPrefix in item) {
+              // Expired
+              if (Date.now() - item[self.expiryPrefix] > 0) {
+                webStorage.removeItem(deriveQualifiedKey(key));
+                return undefined;
+              } else {
+                return item.value;
+              }
+            } else {
+              return item;
+            }
+          }
         } catch (e) {
           return item;
         }
@@ -314,14 +410,14 @@ angular
 
             if (value === null) {
               // Mark that the cookie has expired one day ago
-              expiryDate.setTime(expiryDate.getTime() + (-1 * 24 * 60 * 60 * 1000));
+              expiryDate.setTime(expiryDate.getTime() + (-1 * ONE_DAY_MILLISECONDS));
               expiry = "; expires=" + expiryDate.toGMTString();
               value = '';
             } else if (isNumber(daysToExpiry) && daysToExpiry !== 0) {
-              expiryDate.setTime(expiryDate.getTime() + (daysToExpiry * 24 * 60 * 60 * 1000));
+              expiryDate.setTime(expiryDate.getTime() + (daysToExpiry * ONE_DAY_MILLISECONDS));
               expiry = "; expires=" + expiryDate.toGMTString();
-            } else if (cookie.expiry !== 0) {
-              expiryDate.setTime(expiryDate.getTime() + (cookie.expiry * 24 * 60 * 60 * 1000));
+            } else if (expiry.value !== 0) { // read expiry setting from self.expiry.value instead of cookie.expiry
+              expiryDate.setTime(expiryDate.getTime() + expiry.value);
               expiry = "; expires=" + expiryDate.toGMTString();
             }
             if (!!key) {
